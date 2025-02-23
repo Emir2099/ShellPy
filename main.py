@@ -1,9 +1,10 @@
 import sys
 import os
 import subprocess
-from PyQt5.QtWidgets import QApplication, QMainWindow, QTextEdit, QVBoxLayout, QWidget, QMenuBar, QAction, QColorDialog, QFontDialog
-from PyQt5.QtGui import QTextCursor, QFont
-from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import QApplication, QMainWindow, QTextEdit, QVBoxLayout, QWidget, QMenuBar, QAction, QColorDialog, QFontDialog, QListWidget, QInputDialog
+from PyQt5.QtGui import QTextCursor, QFont, QTextCharFormat, QSyntaxHighlighter, QColor
+from PyQt5.QtCore import Qt, QRegExp, QEvent
+import json
 
 if os.name == 'nt':
     import msvcrt
@@ -12,6 +13,8 @@ else:
     import termios
 
 from autocomplete_trie import compile_trie, autocomplete, longest_common_prefix
+
+env_vars = {}
 
 def populate_path_map():
     path_env = os.environ.get("PATH")
@@ -51,6 +54,8 @@ def parse_arguments(command_input):
     single_quoted = False
     double_quoted = False
     backslashed = False
+    for var in env_vars:
+        command_input = command_input.replace(f"${var}", env_vars[var])
     for ch in command_input:
         if backslashed:
             if backslashed and double_quoted:
@@ -147,6 +152,11 @@ def execute_command(command, output_text):
         output_text.append("Error: No command entered\n")
         return
     args, output_file, err_file = parse_pipes(args)
+    if args[0] == "set":
+        if len(args) >= 3:
+            env_vars[args[1]] = " ".join(args[2:])
+    elif args[0] == "export":
+        os.environ[args[1]] = env_vars.get(args[1], "")
     if err_file is not None and not os.path.exists(err_file.filepath):
         folder_path = "/".join(err_file.filepath.split("/")[:-1])
         if not os.path.exists(folder_path):
@@ -170,7 +180,7 @@ def execute_command(command, output_text):
         if len(args) < 2:
             output_text.append("Error: Missing argument for cd\n")
             return
-        full_path = None
+        target_dir = args[1]
         if args[1][0] == "/":
             if os.path.exists(args[1]):
                 full_path = args[1]
@@ -246,10 +256,58 @@ def execute_command(command, output_text):
         output_result(f"{command}: command not found", output_file)
         output_text.append(f"{command}: command not found\n")
 
+class ShellHighlighter(QSyntaxHighlighter):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.highlighting_rules = []
+
+        # Commands (builtins)
+        command_format = QTextCharFormat()
+        command_format.setForeground(QColor("#569cd6"))  # Blue
+        keywords = ["exit", "echo", "pwd", "cd", "type", "clear"]
+        self.highlighting_rules.append((r'\b(' + '|'.join(keywords) + r')\b', command_format))
+
+        # Paths
+        path_format = QTextCharFormat()
+        path_format.setForeground(QColor("#ce9178"))  # Orange
+        self.highlighting_rules.append((r'[\'"]?([\/\.~][^\s\'"]*)[\'"]?', path_format))
+
+        # Strings
+        string_format = QTextCharFormat()
+        string_format.setForeground(QColor("#ce9178"))  # Orange
+        self.highlighting_rules.append((r'"[^"]*"|\'[^\']*\'', string_format))
+
+        # Errors
+        error_format = QTextCharFormat()
+        error_format.setForeground(QColor("#ff5555"))  # Red
+        self.highlighting_rules.append((r'Error:.*', error_format))
+
+    def highlightBlock(self, text):
+        for pattern, format in self.highlighting_rules:
+            expression = QRegExp(pattern)
+            index = expression.indexIn(text)
+            while index >= 0:
+                length = expression.matchedLength()
+                self.setFormat(index, length, format)
+                index = expression.indexIn(text, index + length)
+
 class ShellUI(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.history = []
+        self.history_index = -1
+        self.draft = ""
+        self.current_theme = "dark"  # Add theme tracking
+        self.suggestion_list = QListWidget()  # Create widget
+        self.suggestion_list.hide()  # But don't add to layout yet
         self.initUI()
+
+    def closeEvent(self, event):
+        with open(os.path.expanduser("~/.shell_history"), "w") as f:
+            json.dump({
+                "history": self.history[-100:],
+                "theme": self.current_theme
+            }, f)
 
     def initUI(self):
         self.setWindowTitle("Shell UI")
@@ -259,12 +317,14 @@ class ShellUI(QMainWindow):
         self.setCentralWidget(self.central_widget)
 
         self.layout = QVBoxLayout(self.central_widget)
-
         self.output_text = QTextEdit(self)
         self.output_text.setReadOnly(False)
         self.output_text.setFont(QFont("Courier", 10))
         self.output_text.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4;")
         self.layout.addWidget(self.output_text)
+        self.layout.addWidget(self.suggestion_list) 
+
+        self.highlighter = ShellHighlighter(self.output_text.document())
 
         self.output_text.append("$ ")
         self.output_text.moveCursor(QTextCursor.End)
@@ -272,6 +332,12 @@ class ShellUI(QMainWindow):
         self.output_text.installEventFilter(self)
 
         self.create_menu()
+        
+        if os.path.exists(os.path.expanduser("~/.shell_history")):
+            with open(os.path.expanduser("~/.shell_history"), "r") as f:
+                data = json.load(f)
+                self.history = data.get("history", [])
+                self.apply_theme(data.get("theme", "dark"))
 
     def create_menu(self):
         menubar = self.menuBar()
@@ -285,6 +351,22 @@ class ShellUI(QMainWindow):
         change_color_action.triggered.connect(self.change_color)
         settings_menu.addAction(change_color_action)
 
+        theme_menu = menubar.addMenu('Themes')
+        dark_action = QAction('Dark', self)
+        dark_action.triggered.connect(lambda: self.apply_theme('dark'))
+        light_action = QAction('Light', self)
+        light_action.triggered.connect(lambda: self.apply_theme('light'))
+        theme_menu.addAction(dark_action)
+        theme_menu.addAction(light_action)
+        
+    def apply_theme(self, theme):
+        themes = {
+            'dark': {"bg": "#1e1e1e", "fg": "#d4d4d4"},
+            'light': {"bg": "white", "fg": "black"}
+        }
+        self.output_text.setStyleSheet(
+            f"background-color: {themes[theme]['bg']}; color: {themes[theme]['fg']};")
+        
     def change_font(self):
         font, ok = QFontDialog.getFont()
         if ok:
@@ -296,44 +378,185 @@ class ShellUI(QMainWindow):
             self.output_text.setStyleSheet(f"background-color: #1e1e1e; color: {color.name()};")
 
     def eventFilter(self, obj, event):
-        if obj == self.output_text and event.type() == event.KeyPress:
-            if event.key() == Qt.Key_Return or event.key() == Qt.Key_Enter:
-                cursor = self.output_text.textCursor()
-                cursor.movePosition(QTextCursor.End, QTextCursor.MoveAnchor)
-                self.output_text.setTextCursor(cursor)
-                command = self.output_text.toPlainText().split("\n")[-1][2:]
-                self.output_text.append("")
-                execute_command(command, self.output_text)
-                self.output_text.append("$ ")
-                self.output_text.moveCursor(QTextCursor.End)
+        if event.type() == QEvent.KeyPress:
+            key_event = event  
+            if key_event.modifiers() == Qt.ControlModifier and key_event.key() == Qt.Key_R:
+                self.show_history_search()
                 return True
-            elif event.key() == Qt.Key_Tab:
+
+            if obj == self.output_text:
+                key = key_event.key()
                 cursor = self.output_text.textCursor()
-                cursor.movePosition(QTextCursor.End, QTextCursor.MoveAnchor)
-                self.output_text.setTextCursor(cursor)
-                current_line = self.output_text.toPlainText().split("\n")[-1][2:]
-                buf_words = current_line.split()
-                if buf_words:
-                    res = autocomplete(buf_words[-1], trie)
-                    if res:
-                        if len(res) == 1:
-                            buf_words[-1] += res[0].word
-                        else:
-                            common_prefix = longest_common_prefix([buf_words[-1] + suffix.word for suffix in res])
-                            if common_prefix:
-                                buf_words[-1] = common_prefix
-                        new_line = " ".join(buf_words)
-                        self.output_text.textCursor().insertText(new_line[len(current_line):])
-                return True
-            elif event.key() == Qt.Key_Backspace:
-                cursor = self.output_text.textCursor()
-                cursor.movePosition(QTextCursor.StartOfLine, QTextCursor.KeepAnchor)
-                if cursor.selectedText().startswith("$ "):
-                    cursor.clearSelection()
-                else:
-                    cursor.deletePreviousChar()
-                return True
+
+                if key not in [Qt.Key_Up, Qt.Key_Down, Qt.Key_Enter]:
+                    self.show_suggestions()
+
+                # Handle Up/Down arrows only on last line
+                if key in [Qt.Key_Up, Qt.Key_Down]:
+                    if cursor.hasSelection():
+                        return False
+                    if cursor.blockNumber() < self.output_text.document().blockCount() - 1:
+                        return False
+                    self.handle_history_navigation(key_event)
+                    return True
+
+                # Enter key - execute command
+                elif key in [Qt.Key_Return, Qt.Key_Enter]:
+                    cursor.movePosition(QTextCursor.End)
+                    self.output_text.setTextCursor(cursor)
+                    command_line = self.output_text.document().lastBlock().text()[2:]  # Get text after "$ "
+                    self.history.append(command_line)
+                    self.history_index = -1
+                    execute_command(command_line, self.output_text)
+                    self.output_text.append("$ ")
+                    self.output_text.moveCursor(QTextCursor.End)
+                    return True
+
+                # Tab key - autocomplete
+                elif key == Qt.Key_Tab:
+                    self.handle_tab_completion()
+                    return True
+
+                # Backspace - prevent deletion of prompt
+                elif key == Qt.Key_Backspace:
+                    if cursor.positionInBlock() > 2:  # Allow deletion only after "$ "
+                        return False  # Let default backspace handle it
+                    else:
+                        return True  # Block deletion of prompt
+
+
         return super().eventFilter(obj, event)
+
+    def show_history_search(self):
+        search, ok = QInputDialog.getText(self, "Search History", "Command:")
+        if ok:
+            matches = [cmd for cmd in self.history if search in cmd]
+            self.suggestion_list.clear()
+            self.suggestion_list.addItems(matches)
+            
+            
+    def show_suggestions(self):
+        """Show command suggestions under cursor"""
+        current_text = self.get_current_line()
+        suggestions = autocomplete(current_text.split()[-1] if current_text else "", trie)
+        self.suggestion_list.clear()
+        for sug in suggestions:
+            self.suggestion_list.addItem(sug.word)
+        if suggestions:
+            cursor_rect = self.output_text.cursorRect()
+            self.suggestion_list.move(
+                self.output_text.mapToGlobal(cursor_rect.bottomLeft()))
+            self.suggestion_list.show()
+
+
+    def handle_history_navigation(self, event):
+        if not self.history:
+            return
+
+        cursor = self.output_text.textCursor()
+        cursor.movePosition(QTextCursor.End)
+
+        if event.key() == Qt.Key_Up:
+            if self.history_index == -1:
+                self.draft = self.get_current_line()
+                self.history_index = len(self.history) - 1
+            elif self.history_index > 0:
+                self.history_index -= 1
+        elif event.key() == Qt.Key_Down:
+            if self.history_index < len(self.history) - 1:
+                self.history_index += 1
+            else:
+                self.history_index = -1
+
+        if self.history_index >= 0:
+            new_text = self.history[self.history_index]
+        else:
+            new_text = self.draft
+
+        self.replace_current_line(new_text)
+
+    def get_current_line(self):
+        return self.output_text.document().lastBlock().text()[2:]
+
+    def replace_current_line(self, text):
+        cursor = self.output_text.textCursor()
+        cursor.movePosition(QTextCursor.StartOfBlock)
+        cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
+        cursor.removeSelectedText()
+        cursor.insertText("$ " + text)
+        self.output_text.setTextCursor(cursor)
+
+    def handle_tab_completion(self):
+        current_line = self.get_current_line()
+        buf_words = current_line.split()
+        if not buf_words:
+            return
+
+        current_word = buf_words[-1]
+        if any(current_word.startswith(prefix) for prefix in ('/', './', '../', '~/', '~')):
+            self.handle_path_completion(current_word, buf_words, current_line)
+        else:
+            self.handle_command_completion(current_word, buf_words, current_line)
+
+    def handle_path_completion(self, current_word, buf_words, current_line):
+        expanded_word = os.path.expanduser(current_word)
+        dirname, partial = os.path.split(expanded_word)
+        dirname = dirname or '.'
+        if not os.path.exists(dirname):
+            return
+
+        try:
+            files = os.listdir(dirname)
+        except:
+            return
+
+        matches = [f for f in files if f.startswith(partial)]
+        if not matches:
+            return
+
+        if len(matches) == 1:
+            completion = matches[0][len(partial):]
+            full_path = os.path.join(dirname, matches[0])
+            if os.path.isdir(full_path):
+                completion += '/'
+            try:
+                preview_items = os.listdir(full_path)[:3]
+                preview = ", ".join(preview_items)
+                if len(os.listdir(full_path)) > 3:
+                    preview += "..."
+                self.output_text.append(f"  Contents: {preview}")
+            except Exception as e:
+                self.output_text.append(f"  Preview error: {str(e)}")
+                
+            buf_words[-1] = current_word + completion
+            new_line = ' '.join(buf_words)
+            self.output_text.textCursor().insertText(new_line[len(current_line):])
+        else:
+            common_prefix = longest_common_prefix(matches)
+            if common_prefix:
+                common_prefix = common_prefix[len(partial):]
+                buf_words[-1] = current_word + common_prefix
+            else:
+                self.show_completion_options(matches)
+
+        new_line = ' '.join(buf_words)
+        self.output_text.textCursor().insertText(new_line[len(current_line):])
+
+    def handle_command_completion(self, current_word, buf_words, current_line):
+        res = autocomplete(current_word, trie)
+        if res:
+            if len(res) == 1:
+                buf_words[-1] += res[0].word
+            else:
+                common_prefix = longest_common_prefix([buf_words[-1] + suffix.word for suffix in res])
+                if common_prefix:
+                    buf_words[-1] = common_prefix
+            new_line = " ".join(buf_words)
+            self.output_text.textCursor().insertText(new_line[len(current_line):])
+
+    def show_completion_options(self, matches):
+        self.output_text.append("\n" + " ".join(matches))
+        self.output_text.moveCursor(QTextCursor.End)
 
 def main():
     global builtins, path_map, trie
